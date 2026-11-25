@@ -2,7 +2,7 @@
 
 > Mọi con số lấy từ report JSON trong [`reports/`](reports/) (bản gốc ở `06-lab-complete/benchmark-observability/develop/reports/`), CSV và screenshot thật, không ước lượng.
 
-**Họ tên:** Nguyen The Cuong
+**Họ tên:** Nguyễn Thế Cường
 **Ngày chạy:** 2026-11-25
 **Môi trường:** Laptop Intel Core i7-10750H (6 nhân / 12 luồng), RAM 16 GB, Windows 11 + WSL2 Ubuntu 26.04 (WSL được cấp 12 vCPU / 7 GB RAM), Python 3.11.18, Docker Desktop (Docker 29.9.3). Agent và công cụ tạo tải chạy **trên cùng một máy**.
 
