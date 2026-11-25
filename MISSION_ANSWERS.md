@@ -240,13 +240,78 @@ INFO:     127.0.0.1:38182 - "GET /health HTTP/1.1" 200 OK
 
 ## Part 3: Cloud Deployment
 
-### Exercise 3.1 / 3.2: Deployment
-- URL:
-- Screenshot:
+Lớp K5 deploy luôn agent Part 6 (`06-lab-complete/`), không deploy app mẫu trong `03-cloud-deployment/` (xem CHECKPOINTS, CP6).
+
+### Exercise 3.1: Railway deployment
+
+- **URL:** https://agent-production-58f1ea7e.up.railway.app
+- **Platform:** Railway. Project `day14-agent` gồm service `agent` (build từ Dockerfile của `06-lab-complete/`) và service `Redis`.
+- **Chi tiết** (lệnh deploy, biến môi trường, kết quả test): [DEPLOYMENT.md](DEPLOYMENT.md)
+- **Screenshot:** [dashboard](screenshots/dashboard.png) · [running](screenshots/running.png) · [test](screenshots/test.png)
+
+4 lệnh tự kiểm của CP6 (mỗi lệnh chỉ in mã HTTP):
+
+```text
+$ curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/health"                         → 200
+$ curl -sS -o /dev/null -w '%{http_code}\n' "$BASE/ready"                          → 200
+$ curl ... -X POST "$BASE/ask" (không có key)                                      → 401
+$ curl ... -X POST "$BASE/ask" -H "X-API-Key: $AGENT_API_KEY"                       → 200
+```
+
+Script chấm với URL public: `✅ Public URL: GET https://agent-production-58f1ea7e.up.railway.app/health → 200`.
+
+**Cách đặt biến môi trường trên cloud:** dùng `railway variables --set` cho service `agent`. Key của `AGENT_API_KEY` được sinh ngẫu nhiên và chỉ nằm trên Railway cùng một file trên máy cá nhân, ngoài repo. `REDIS_URL` dùng biến tham chiếu `${{Redis.REDIS_URL}}`: Railway tự điền URL **nội bộ** của service Redis (`redis.railway.internal:6379`, có mật khẩu), nên không phải copy mật khẩu Redis bằng tay và Redis không mở ra Internet. `PORT` không tự đặt: Railway cấp `8080`, và log khởi động cho thấy uvicorn nghe đúng cổng đó nhờ `${PORT:-8000}` trong `CMD`.
+
+**Cách xem logs:** `railway logs --service agent`, hoặc Dashboard → service `agent` → Deployments → View logs. Railway nhận ra log JSON của app và hiển thị thành field có cấu trúc:
+
+```text
+INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+[INFO] ts="2026-11-25T10:23:04.980+00:00" logger="agent" event="startup" version="1.0.0" environment="production" port=8080 rate_limit_per_minute=10 daily_budget_usd=1 api_key_configured=true
+INFO:     100.64.0.1:24708 - "GET /health HTTP/1.1" 200 OK
+```
+
+**Ghi chú:** khi chạy CLI, Railway cảnh báo định dạng `railway.toml` (Config as Code) sẽ được thay bằng `.railway/railway.ts`, nhưng file hiện tại vẫn dùng được tới 2026-12-01. Mình giữ `railway.toml` vì script chấm kiểm tra đúng file này.
 
 ### So sánh railway.toml và render.yaml
 
-### Exercise 3.3: Cloud Run pipeline
+So sánh bản mẫu (`03-cloud-deployment/railway/railway.toml`, `03-cloud-deployment/render/render.yaml`) và bản mình viết cho Part 6 (`06-lab-complete/`):
+
+| Khía cạnh | `railway.toml` | `render.yaml` |
+|-----------|----------------|---------------|
+| Định dạng, phạm vi | TOML, cấu hình **một service** (service đang deploy). Các service khác (Redis) tạo riêng bằng CLI hoặc dashboard | YAML Blueprint, mô tả **cả hạ tầng** trong một file: nhiều service, database, biến môi trường. Render tạo đủ mọi thứ từ file này |
+| Cách build | `[build] builder = "NIXPACKS"` (tự nhận diện Python) ở bản mẫu; `"DOCKERFILE"` ở bản Part 6 | `runtime: python` + `buildCommand: pip install ...` ở bản mẫu; `runtime: docker` + `dockerfilePath` ở bản Part 6 |
+| Lệnh chạy | `startCommand = "uvicorn app:app --host 0.0.0.0 --port $PORT"` (bản Part 6 bỏ dòng này, dùng `CMD` của Dockerfile) | `startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT` (với `runtime: docker` thì dùng `CMD`) |
+| Health check | `healthcheckPath = "/health"`, `healthcheckTimeout` | `healthCheckPath: /health` |
+| Restart | Khai báo rõ: `restartPolicyType = "ON_FAILURE"`, `restartPolicyMaxRetries = 3` | Không có tuỳ chọn; Render tự restart khi health check fail |
+| Biến môi trường và secret | **Không nằm trong file**: đặt bằng `railway variables` hoặc dashboard. Tham chiếu chéo service bằng `${{Redis.REDIS_URL}}` | Khai báo **trong file** (`envVars`). Giá trị thường ghi thẳng (`value:`); secret thì `generateValue: true` (Render tự sinh) hoặc `sync: false` (điền tay trên dashboard), không bao giờ ghi giá trị thật |
+| Redis | Không khai báo trong file, thêm bằng `railway add --database redis` | Khai báo ngay trong file (`type: redis` ở bản mẫu, `type: keyvalue` ở bản Part 6) và nối vào web service bằng `fromService ... property: connectionString` |
+| Region, gói | Không có trong file | `region: singapore`, `plan: free` |
+| Auto deploy | `railway up` đẩy code từ máy lên (hoặc nối repo GitHub) | `autoDeploy: true`: tự deploy mỗi khi push lên GitHub |
+| Vị trí file | Nằm trong thư mục được `railway up` | Blueprint đọc file từ **gốc repo**, hoặc khai báo `rootDir` cho service nằm trong thư mục con (bản Part 6 dùng `rootDir: 06-lab-complete`) |
+
+**Vì sao khác nhau:** Railway tách **cấu hình build/deploy** (trong file) khỏi **hạ tầng và secret** (CLI, dashboard), nên file ngắn và chỉ lo một service. Render đi theo hướng Infrastructure as Code đầy đủ: một file Blueprint dựng lại được cả hệ thống (web + Redis + biến môi trường), tiện để tái tạo môi trường từ đầu. Cái giá là phải cẩn thận để secret không lọt vào file, vì vậy mới có `generateValue` và `sync: false`.
+
+### Exercise 3.3: Cloud Run CI/CD pipeline
+
+`cloudbuild.yaml` là pipeline Cloud Build gồm 4 bước, bước sau chờ bước trước xong (`waitFor`):
+
+1. **test:** trong image `python:3.11-slim`, cài requirements + pytest rồi chạy `pytest tests/`. Test fail thì pipeline dừng, không build.
+2. **build:** `docker build` image và gắn 2 tag: `gcr.io/$PROJECT_ID/ai-agent:$COMMIT_SHA` (mỗi commit một bản, dễ rollback) và `:latest`; `--cache-from :latest` để dùng lại layer cũ cho nhanh.
+3. **push:** đẩy cả hai tag lên Container Registry.
+4. **deploy:** `gcloud run deploy` bằng image đúng `$COMMIT_SHA` lên region `asia-southeast1`: public (`--allow-unauthenticated`), từ 1 đến 10 instance, 512Mi RAM / 1 CPU, timeout 60s. `OPENAI_API_KEY` lấy từ **Secret Manager** (`--set-secrets`) chứ không ghi trong file.
+
+`service.yaml` mô tả cùng service đó dưới dạng khai báo (Knative), dùng với `gcloud run services replace`:
+- `minScale: 1` giữ sẵn một instance để tránh cold start; `maxScale: 10`.
+- `containerConcurrency: 80`: mỗi instance xử lý tối đa 80 request đồng thời, vượt thì Cloud Run tự thêm instance.
+- Giới hạn tài nguyên (1 CPU / 512Mi).
+- Secret `OPENAI_API_KEY`, `AGENT_API_KEY` lấy từ Secret Manager.
+- `livenessProbe` gọi `/health` mỗi 30 giây; `startupProbe` gọi `/ready` để chỉ nhận traffic khi app đã sẵn sàng.
+
+Tóm lại: **push lên main → test → build image → push lên registry → deploy lên Cloud Run**, secret nằm trong Secret Manager.
+
+Hai chỗ trong file mẫu sẽ lỗi nếu chạy thật:
+- Thư mục `03-cloud-deployment/production-cloud-run/` **không có `tests/`** (cũng không có Dockerfile hay requirements), nên bước test sẽ fail ngay.
+- `service.yaml` tự khai báo biến `PORT`, nhưng `PORT` là biến dành riêng mà Cloud Run tự đặt theo `containerPort`; tự khai báo sẽ bị Cloud Run từ chối.
 
 ## Part 4: API Security
 
@@ -708,3 +773,4 @@ Log của app (mỗi dòng là một JSON object):
 | CP3 | Nhờ Claude chạy test Part 4 (API key, JWT, vòng lặp rate limit), viết hàm cost guard bằng Redis và soạn câu trả lời | Script chạy cả hai bản trong WSL, output curl đã che token; hàm `check_budget` dùng `INCRBYFLOAT` + key theo tháng, test với Redis container; phát hiện field `budget_remaining_usd` trả sai và header `server` không bị xoá | Đối chiếu mã 401/403/200/429 với code `auth.py`, `rate_limiter.py`; kiểm tra kết quả test cost guard (lần gọi 8+3 bị chặn, TTL 32 ngày); đọc lại lý do dùng `INCRBYFLOAT` thay vì GET rồi SET |
 | CP4 | Nhờ Claude chạy Part 5 (health/ready, thử SIGTERM khi đang có request, stack 3 instance, `test_stateless.py`, kill 1 instance) và soạn câu trả lời | Output thật của các test; giải thích vì sao log `Received signal 15` in cuối cùng; phát hiện app lặng lẽ chuyển sang lưu RAM khi không có Redis, field `turn` lệch 1, Nginx chỉ phân giải DNS lúc khởi động. Lần kill đầu bị sai (dùng nhầm `docker compose stop agent-2`), Claude tự phát hiện vì vẫn thấy đủ 3 instance và làm lại bằng `docker stop` | Đối chiếu IP trong `X-Served-By` với lỗi `Host is unreachable` trong log Nginx; kiểm tra request dài vẫn trả 200 sau SIGTERM và exit code 0; kiểm tra history còn đủ 14 tin sau khi kill instance |
 | CP5 | Nhờ Claude **viết toàn bộ code Part 6** (`app/*.py`, Dockerfile, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`) và soạn phần giải thích | Claude đọc README "hợp đồng" và toàn bộ `check_production_ready.py` trước khi viết; phát hiện `pydantic==2.9.0` không cài được trên Python 3.14, nên tạo lại venv Python 3.11 bằng `uv`; code đạt `PASS 12/12` ở lần chạy đầy đủ đầu tiên. Không sửa `check_production_ready.py` | Chạy `check_production_ready.py` bản đầy đủ có Docker; tự test thêm bằng `docker compose`: 401/200/422, 429 sau 10 request, tắt Redis thì `/health` 200 còn `/ready` 503, bật lại thì phục hồi; kiểm tra API key không xuất hiện trong log; đọc lại từng file để giải thích được với Lab Coach |
+| CP6 | Nhờ Claude deploy agent Part 6 lên Railway, viết `DEPLOYMENT.md`, so sánh `railway.toml`/`render.yaml` và mô tả pipeline Cloud Run | Claude cài Railway CLI, tạo project, Redis, service `agent`, đặt biến (key sinh ngẫu nhiên, lưu ngoài repo, không in ra), `railway up`, tạo domain; chạy 4 lệnh tự kiểm và `--public-url`. Tôi tự đăng nhập Railway | Kiểm tra 4 mã 200/200/401/200 trên URL public; xem log Railway thấy `PORT=8080` và `api_key_configured=true`; đối chiếu bảng so sánh với 2 file config; tự chụp 3 ảnh deploy |
