@@ -250,9 +250,174 @@ INFO:     127.0.0.1:38182 - "GET /health HTTP/1.1" 200 OK
 
 ## Part 4: API Security
 
-### Exercise 4.1-4.3: Test results
+### Exercise 4.1: API Key authentication
+
+File: `04-api-gateway/develop/app.py`. Chạy: `AGENT_API_KEY=secret-key-123 python app.py`
+
+**API key được check ở đâu?**
+- `api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)` (dòng 36) đọc header `X-API-Key`.
+- Hàm `verify_api_key` (dòng 39–54) kiểm tra key.
+- Hàm này được gắn vào endpoint bằng `Depends(verify_api_key)` (dòng 70). FastAPI chạy dependency **trước** khi vào thân hàm `/ask`, nên request sai key không bao giờ chạm tới LLM. `/` và `/health` không gắn dependency nên vẫn public.
+
+**Sai key thì sao?** Thiếu header thì trả **401** `Missing API key`; có header nhưng sai key thì trả **403** `Invalid API key`. Lưu ý: Part 6 yêu cầu **cả hai trường hợp đều 401**, nên không được copy nguyên logic này.
+
+**Rotate key thế nào?** Key đọc từ biến môi trường `AGENT_API_KEY` (dòng 35), nên chỉ cần đặt giá trị mới trên platform rồi restart hoặc redeploy, không phải sửa code. Bản này chỉ so với **một** key, nên lúc đổi key mọi client cũ bị 401 ngay. Muốn rotate không gián đoạn thì cho phép nhiều key cùng lúc (vd `AGENT_API_KEYS=new,old`), chuyển client sang key mới, rồi mới bỏ key cũ.
+
+**Vấn đề còn lại:** có key mặc định `"demo-key-change-in-production"` (dòng 35). Quên đặt env thì app vẫn chạy với key ai cũng biết. Ngoài ra dòng 91 **in key ra stdout** lúc khởi động, lặp lại lỗi lộ secret ra log của Part 1.
+
+```text
+$ curl -i http://localhost:8000/ask -X POST -H "Content-Type: application/json" -d '{"question": "Hello"}'
+HTTP/1.1 401 Unauthorized
+content-type: application/json
+
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+
+$ curl -i http://localhost:8000/ask -X POST -H "X-API-Key: wrong-key" -H "Content-Type: application/json" -d '{"question": "Hello"}'
+HTTP/1.1 403 Forbidden
+content-type: application/json
+
+{"detail":"Invalid API key."}
+
+$ curl -i http://localhost:8000/ask -X POST -H "X-API-Key: secret-key-123" -H "Content-Type: application/json" -d '{"question": "Hello"}'
+HTTP/1.1 200 OK
+content-type: application/json
+
+{"question":"Hello","answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận."}
+```
+
+### Exercise 4.2: JWT authentication
+
+File: `04-api-gateway/production/auth.py`. Endpoint lấy token là `POST /auth/token`, tài khoản `student` / `demo123`.
+
+**JWT flow:**
+
+1. Client gửi username/password tới `POST /auth/token`. `authenticate_user` (dòng 70–75) so với `DEMO_USERS`; sai thì trả 401.
+2. `create_token` (dòng 35–43) tạo payload `{sub, role, iat, exp = now + 60 phút}` rồi **ký** bằng HS256 với `JWT_SECRET`. Token gồm 3 phần `header.payload.signature`.
+3. Client gửi token ở mỗi request: `Authorization: Bearer <token>`.
+4. `verify_token` (dòng 46–67) gọi `jwt.decode`, kiểm tra chữ ký và hạn dùng: không có token thì 401, hết hạn thì 401, chữ ký sai hoặc token giả thì 403. Hợp lệ thì lấy ra `username` và `role` để dùng tiếp (rate limit theo role).
+
+Server **không cần tra database** ở mỗi request: thông tin user nằm sẵn trong token, và chữ ký chứng minh token do server phát hành, không bị sửa. Đổi lại, token đã phát thì không thu hồi được trước khi hết hạn (trừ khi có blacklist), và payload chỉ được **mã hoá base64 chứ không bị giấu**, nên không được bỏ thông tin nhạy cảm vào đó. `JWT_SECRET` cũng có giá trị mặc định trong code (dòng 22); production phải đặt bằng env.
+
+```text
+$ curl -i http://localhost:8000/auth/token -X POST -H "Content-Type: application/json" -d '{"username": "student", "password": "demo123"}'
+HTTP/1.1 200 OK
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+
+{"access_token":"eyJ...<masked>","token_type":"bearer","expires_in_minutes":60,"hint":"Include in header: Authorization: Bearer eyJ...<masked>"}
+
+$ curl -i http://localhost:8000/auth/token -X POST -H "Content-Type: application/json" -d '{"username": "student", "password": "nope"}'
+HTTP/1.1 401 Unauthorized
+
+{"detail":"Invalid credentials"}
+
+$ curl -i http://localhost:8000/ask -X POST -H "Content-Type: application/json" -d '{"question": "Explain JWT"}'
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer
+
+{"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+
+$ curl -i http://localhost:8000/ask -X POST -H "Authorization: Bearer abc.def.ghi" -H "Content-Type: application/json" -d '{"question": "Explain JWT"}'
+HTTP/1.1 403 Forbidden
+
+{"detail":"Invalid token."}
+
+$ curl -i http://localhost:8000/ask -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"question": "Explain JWT"}'
+HTTP/1.1 200 OK
+
+{"question":"Explain JWT","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé.","usage":{"requests_remaining":9,"budget_remaining_usd":1.6e-05}}
+```
+
+### Exercise 4.3: Rate limiting
+
+File: `04-api-gateway/production/rate_limiter.py`
+
+- **Algorithm:** **sliding window**. Mỗi user có một `deque` chứa timestamp các request trong 60 giây gần nhất. Mỗi lần check, các timestamp cũ hơn `now - 60s` bị bỏ khỏi đầu deque (dòng 39–40); nếu số còn lại đã đạt `max_requests` thì trả 429, ngược lại thêm `now` vào deque. Cửa sổ trượt theo từng request nên không bị lỗi "dồn request ở ranh giới phút" như fixed window. (Docstring gọi là *Sliding Window Counter*, nhưng vì lưu từng timestamp nên đúng ra là *sliding window log*.)
+- **Limit:** user thường **10 request/phút** (`rate_limiter_user`, dòng 86); admin **100 request/phút** (`rate_limiter_admin`, dòng 87).
+- **Bypass cho admin:** `app.py` dòng 141 chọn limiter theo `role` lấy từ JWT: `rate_limiter_admin if role == "admin" else rate_limiter_user`. Admin **không được bỏ qua hoàn toàn**, mà dùng một giới hạn cao hơn (100/phút). Thử với `teacher` (role admin): 12 request liên tiếp đều 200. Vì `role` nằm trong token có chữ ký, user thường không tự sửa thành admin được.
+- **Hạn chế:** state nằm trong RAM của process. Restart là mất, và chạy nhiều instance hoặc worker thì mỗi cái đếm riêng (giới hạn thực tế thành 10 × số instance). Part 6 phải chuyển sang Redis.
+
+Vòng lặp 20 request với token `student`:
+
+```text
+Request 1 -> 200 ... "requests_remaining":8
+Request 2 -> 200
+...
+Request 9 -> 200 ... "requests_remaining":0
+Request 10 -> 429 {"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":59}}
+Request 11 -> 429
+...
+Request 20 -> 429
+```
+
+Request thứ 10 của vòng lặp đã bị 429 vì request `Explain JWT` ở bài 4.2 cũng được tính: tổng cộng đúng 10 request thành công trong 60 giây, request thứ 11 bị chặn.
+
+```text
+$ curl -i ... (request tiếp theo)
+HTTP/1.1 429 Too Many Requests
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1795597325
+retry-after: 59
+content-type: application/json
+
+{"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":59}}
+
+--- teacher (role admin), 12 request liên tiếp
+200 200 200 200 200 200 200 200 200 200 200 200
+```
+
+**Quan sát thêm khi chạy:**
+- Field `budget_remaining_usd` trong response `/ask` thực ra trả về **số tiền đã dùng** (`usage.total_cost_usd`, `app.py` dòng 160), không phải số còn lại. `/me/usage` mới trả đúng `budget_remaining_usd: 0.999812`.
+- Middleware `security_headers` cố xoá header `server` (dòng 84–85) nhưng response vẫn có `server: uvicorn`, vì uvicorn thêm header này ở tầng giao thức, sau khi middleware đã chạy. Muốn ẩn thì chạy uvicorn với `server_header=False` (hoặc `--no-server-header`).
 
 ### Exercise 4.4: Cost guard implementation
+
+**Yêu cầu:** mỗi user $10/tháng, theo dõi trong Redis, reset đầu tháng.
+
+```python
+import os
+from datetime import datetime, timezone
+import redis
+
+r = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), decode_responses=True)
+MONTHLY_BUDGET_USD = float(os.getenv("MONTHLY_BUDGET_USD", "10"))
+
+def check_budget(user_id: str, estimated_cost: float) -> bool:
+    """True nếu còn budget (và đã trừ estimated_cost), False nếu vượt."""
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
+    key = f"budget:{user_id}:{month}"               # key mới mỗi tháng => tự "reset đầu tháng"
+    new_total = r.incrbyfloat(key, estimated_cost)  # cộng nguyên tử, an toàn khi nhiều instance
+    if new_total == estimated_cost:
+        r.expire(key, 32 * 24 * 3600)               # key mới tạo: tự xoá sau 32 ngày
+    if new_total > MONTHLY_BUDGET_USD:
+        r.incrbyfloat(key, -estimated_cost)         # hoàn lại phần vừa cộng
+        return False
+    return True
+```
+
+**Cách làm:**
+
+1. **Key theo user và tháng:** `budget:<user_id>:<YYYY-MM>`. Sang tháng mới thì tên key đổi, tổng chi tự bắt đầu lại từ 0, không cần cron job reset. Dùng giờ UTC để mọi instance thống nhất ranh giới tháng.
+2. **`INCRBYFLOAT` trước rồi mới kiểm tra.** Lời giải mẫu trong CODE_LAB làm `GET` → so sánh → `INCRBYFLOAT`. Khi nhiều instance cùng xử lý request của một user, hai request có thể cùng `GET` thấy còn budget rồi cùng cộng, dẫn tới vượt ngân sách (race condition). `INCRBYFLOAT` là thao tác nguyên tử của Redis: cộng và trả về tổng mới trong một bước, nên mỗi request thấy một tổng khác nhau. Nếu vượt thì trừ lại phần vừa cộng.
+3. **`EXPIRE` 32 ngày** khi key vừa được tạo, để key của các tháng cũ tự bị xoá, Redis không phình mãi.
+4. **Lưu trong Redis chứ không trong RAM**, nên state được chia sẻ giữa mọi instance và không mất khi restart (khác với `CostGuard` in-memory của `cost_guard.py`).
+5. Ở endpoint: gọi `check_budget(user, estimated_cost)` **trước** khi gọi LLM; nếu `False` thì `raise HTTPException(402, "Monthly budget exceeded")`.
+
+**Test với Redis thật** (`docker run -d --rm -p 6379:6379 redis:7-alpine`):
+
+```text
+call 1: +$4.0  -> ALLOW         spent=4.00
+call 2: +$4.0  -> ALLOW         spent=8.00
+call 3: +$3.0  -> BLOCK (402)   spent=8.00     # 8 + 3 > 10, đã hoàn lại
+call 4: +$1.5  -> ALLOW         spent=9.50
+call 5: +$0.5  -> ALLOW         spent=10.00    # đúng bằng 10 vẫn cho phép
+key: budget:alice:2026-11 | TTL (days): 32.0
+bob (user khác): True                           # budget tách riêng từng user
+```
+
+**Vì sao cần cả rate limit lẫn cost guard:** rate limit bảo vệ **tốc độ** (chống spam, chống một user làm nghẽn server), còn cost guard bảo vệ **tiền**. Chỉ có rate limit thì user vẫn có thể gửi đều 10 request/phút suốt cả tháng, mỗi request là một câu hỏi dài tốn nhiều token, và hoá đơn vẫn tăng không giới hạn. Chỉ có cost guard thì một user có thể bắn hàng nghìn request rẻ trong một giây làm sập server. Hai lớp chặn hai rủi ro khác nhau.
 
 ## Part 5: Scaling & Reliability
 
@@ -271,3 +436,4 @@ INFO:     127.0.0.1:38182 - "GET /health HTTP/1.1" 200 OK
 | CP0 | Kiểm tra môi trường | Phát hiện Docker Desktop chưa bật, WSL chưa có Ubuntu, thiếu pip/venv, chưa bật WSL integration | Tự cài Ubuntu, bật WSL integration, chạy `docker run --rm hello-world` và `os.name == posix` trong Ubuntu |
 | CP1 | Nhờ Claude hướng dẫn chạy Part 1, giải thích vì sao log JSON không hiện, và soạn câu trả lời Exercise 1.1–1.3 | Danh sách anti-pattern kèm số dòng; giải thích `logging.warning` trong `config.py` chạy trước `basicConfig`; phát hiện log JSON lồng không hợp lệ; Claude soạn bảng anti-pattern, bảng so sánh và phần quan sát dựa trên output tôi chạy | Tự chạy cả hai bản và chụp output (`/health` 404 ở develop, 200 ở production); kiểm chứng giả thuyết logging bằng `OPENAI_API_KEY=dummy python app.py`; đọc lại từng dòng code được trích để đối chiếu |
 | CP2 | Nhờ Claude chạy Part 2 (build 2 image, chạy container, chạy stack Compose) và soạn câu trả lời | Claude chạy các lệnh `docker build/run/compose` trên máy tôi, đo kích thước bằng `docker images`, xử lý lỗi cổng 80 bằng file override sang 8081, soạn câu trả lời 2.1–2.4 và sơ đồ | Số MB lấy từ output `docker images` trên máy tôi; đối chiếu câu trả lời với từng dòng trong 2 Dockerfile và `docker-compose.yml`; kiểm tra IP trong log agent là IP của Nginx |
+| CP3 | Nhờ Claude chạy test Part 4 (API key, JWT, vòng lặp rate limit), viết hàm cost guard bằng Redis và soạn câu trả lời | Script chạy cả hai bản trong WSL, output curl đã che token; hàm `check_budget` dùng `INCRBYFLOAT` + key theo tháng, test với Redis container; phát hiện field `budget_remaining_usd` trả sai và header `server` không bị xoá | Đối chiếu mã 401/403/200/429 với code `auth.py`, `rate_limiter.py`; kiểm tra kết quả test cost guard (lần gọi 8+3 bị chặn, TTL 32 ngày); đọc lại lý do dùng `INCRBYFLOAT` thay vì GET rồi SET |
