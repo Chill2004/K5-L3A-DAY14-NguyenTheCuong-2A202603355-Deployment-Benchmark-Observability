@@ -615,9 +615,88 @@ Ghi chú khi chạy: lệnh `docker compose stop agent-2` không dừng được
 
 ## Part 6: Final Project
 
+Chạy `python check_production_ready.py` (bản đầy đủ, có Docker) trong `06-lab-complete/`, trên WSL2 Ubuntu với Python 3.11:
+
 ```text
-(dán phần "📋 Checklist Deliverable" của check_production_ready.py)
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
 ```
+
+Một số dòng chi tiết đáng chú ý trong output: image **273 MB**; `429 sau 5 request thành công (RATE_LIMIT_PER_MINUTE=5)`; restart agent vẫn bị 429; `402 ở request thứ 1`; `15 dòng JSON`; SIGTERM khi đang có request thì request vẫn 200, exit code 0; `docker stop` xong trong 0.9s với exit code 0.
+
+### Cách làm từng phần
+
+| File | Làm gì | Vì sao |
+|------|--------|--------|
+| `app/config.py` | `Settings` đọc mọi giá trị bằng `os.getenv` (PORT, ENVIRONMENT, LOG_LEVEL, AGENT_API_KEY, REDIS_URL, RATE_LIMIT_PER_MINUTE, DAILY_BUDGET_USD, giá token) | 12-Factor: một image chạy mọi môi trường. `AGENT_API_KEY` **không có default**, nên quên đặt key thì app từ chối tất cả request, không chạy với một key ai cũng biết |
+| `app/redis_client.py` | `redis.Redis.from_url(..., socket_connect_timeout=1, socket_timeout=1)`; `redis_healthy()` ping và bắt `RedisError` | `from_url` không kết nối ngay, nên container khởi động được khi chưa có Redis. Timeout ngắn để Redis chết thì lỗi nhanh thay vì treo request |
+| `app/auth.py` | `APIKeyHeader("X-API-Key", auto_error=False)`, thiếu hoặc sai đều trả **401**; so sánh bằng `hmac.compare_digest` | `auto_error=False` để FastAPI không tự trả 403/422. `compare_digest` so sánh trong thời gian không đổi, chống dò key bằng cách đo thời gian phản hồi |
+| `app/rate_limiter.py` | Sliding window 60s bằng sorted set `ratelimit:<sha256(key)>`: trong một `MULTI/EXEC` chạy `ZREMRANGEBYSCORE` → `ZADD` → `ZCARD` → `EXPIRE`; vượt thì `ZREM` request vừa thêm và trả 429 kèm `Retry-After` tính từ request cũ nhất | State trong Redis nên 2 worker và nhiều instance đếm chung, restart không mất. Transaction để worker khác không chen giữa lúc đếm. Request bị chặn không tính vào quota. Redis chỉ lưu hash của key, không lưu key gốc |
+| `app/cost_guard.py` | Key `cost:YYYY-MM-DD` (UTC). `check_budget()`: tổng hôm nay >= `DAILY_BUDGET_USD` thì 402. `record_cost()`: `INCRBYFLOAT` + `EXPIRE` 2 ngày | Sang ngày mới key đổi, tổng tự về 0 mà không cần cron. `INCRBYFLOAT` là thao tác nguyên tử nên không mất số khi nhiều worker cùng ghi |
+| `app/main.py` | `JsonFormatter` dùng `json.dumps` cho cả bản ghi, gắn vào logger `agent` riêng; middleware log mỗi request (method, path, status, ms, `X-Request-ID`); `/health` không đụng Redis; `/ready` trả 503 khi Redis lỗi hoặc đang tắt; `/ask` = `Depends(verify_api_key)` → rate limit → budget → LLM → `record_cost`; handler `RedisError` → 503, `Exception` → 500 chung chung | Log JSON hợp lệ, khác Part 1 vốn ghép chuỗi làm JSON lồng không escape. Logger riêng không đụng logger của uvicorn. Không log nội dung câu hỏi hay API key. Lỗi trả mã rõ ràng, không lộ stack trace |
+| Graceful shutdown | Dùng `lifespan`: sau `yield` thì đặt `shutting_down=True` (để `/ready` trả 503), log `shutdown`, đóng kết nối Redis. **Không** tự đăng ký handler SIGTERM | Thí nghiệm ở Part 5 cho thấy uvicorn đã tự xử lý SIGTERM (ngừng nhận request mới, chờ request đang chạy xong). Tự ghi đè handler mà không gọi lại handler cũ thì process không bao giờ tắt |
+| `Dockerfile` | Builder `python:3.11-slim` cài requirements vào `/opt/venv`; runtime `python:3.11-slim` chỉ copy venv + `app/` + `utils/`, user `app` (non-root), `HEALTHCHECK` gọi `/health` theo `$PORT`, `CMD ["sh","-c","exec uvicorn ... --port ${PORT:-8000} --workers 2"]` | Venv ở đường dẫn cố định nên không gặp lỗi `PYTHONUSERBASE` như khi dùng `pip --user`. `exec` để uvicorn là PID 1 và nhận SIGTERM trực tiếp, nên `docker stop` xong trong 0.9s thay vì bị SIGKILL sau 10s |
+| `docker-compose.yml` | `agent` (build, `REDIS_URL=redis://redis:6379/0`, `env_file .env` với `required: false`, `depends_on: redis: condition: service_healthy`) + `redis:7-alpine` (healthcheck `redis-cli ping`, AOF + volume) | Agent chỉ start khi Redis đã healthy; volume giữ rate limit và chi phí khi Redis restart |
+| `.dockerignore` | Loại `.env*` (giữ `.env.example`), `__pycache__`, `venv`, `.git`, `benchmark-observability/`, tài liệu, script chấm | Không đưa secret vào image, build context nhỏ |
+| `railway.toml` / `render.yaml` | Railway: `builder = "DOCKERFILE"`, `healthcheckPath = "/health"`. Render: `type: web`, `runtime: docker`, `healthCheckPath: /health`, `AGENT_API_KEY` dùng `generateValue: true`, `REDIS_URL` lấy từ service Key Value | Không ghi secret trong file config; port do platform cấp qua `$PORT` |
+
+### Test thêm bằng `docker compose` (ngoài script chấm)
+
+Chạy `docker compose up -d --build` với một API key ngẫu nhiên truyền qua biến môi trường (không ghi vào file):
+
+```text
+$ GET /health                       → 200 {"status":"ok","version":"1.0.0","environment":"development","uptime_seconds":0.9}
+$ GET /ready                        → 200 {"status":"ready","redis":"ok"}
+$ POST /ask (no key)                → 401 {"detail":"Invalid or missing API key. Include header: X-API-Key: <key>"}
+$ POST /ask (wrong key)             → 401 {"detail":"Invalid or missing API key. Include header: X-API-Key: <key>"}
+$ POST /ask (correct key)           → 200 {"question":"What is deployment?","answer":"Deployment là quá trình đưa code từ máy bạn lên server để người khác dùng được.","usage":{"input_tokens":5,"output_tokens":20,"cost_usd":1.275e-05}}
+$ POST /ask {"invalid":"data"}      → 422 {"detail":[{"type":"missing","loc":["body","question"],"msg":"Field required",...}]}
+$ POST /ask (JSON hỏng)             → 422 {"detail":[{"type":"json_invalid",...,"msg":"JSON decode error",...}]}
+$ POST /ask {"question":""}         → 422 {"detail":[{"type":"string_too_short",...,"msg":"String should have at least 1 character",...}]}
+
+Rate limit (RATE_LIMIT_PER_MINUTE=10), 12 request liên tiếp:
+200 200 200 200 200 200 200 200 200 429 429 429      (+1 request "correct key" ở trên = 10 request thành công)
+
+$ docker compose stop redis
+$ GET /health (redis down)          → 200    liveness không phụ thuộc Redis
+$ GET /ready  (redis down)          → 503 {"detail":"Redis not reachable"}
+$ POST /ask   (redis down)          → 503 {"detail":"Dependency unavailable, try again later"}  + Retry-After: 5
+$ docker compose start redis
+$ GET /ready  (redis back)          → 200    tự phục hồi, không cần restart agent
+
+Key trong Redis: ratelimit:0dc366587e947675 (hash, không phải API key gốc), cost:2026-11-25
+Số lần API key xuất hiện trong log agent: 0
+```
+
+Log của app (mỗi dòng là một JSON object):
+
+```text
+{"ts": "2026-11-25T09:21:58.490+00:00", "lvl": "INFO", "logger": "agent", "event": "llm_call", "question_chars": 6, "input_tokens": 2, "output_tokens": 17, "cost_usd": 1.05e-05}
+{"ts": "2026-11-25T09:21:58.500+00:00", "lvl": "INFO", "logger": "agent", "event": "request", "request_id": "d996a11df627", "method": "POST", "path": "/ask", "status": 429, "ms": 1.8}
+{"ts": "2026-11-25T09:22:10.781+00:00", "lvl": "ERROR", "logger": "agent", "event": "redis_unavailable", "path": "/ask", "error": "ConnectionError"}
+```
+
+**Ghi chú:**
+
+- **Môi trường:** `requirements.txt` ghim `pydantic==2.9.0`, bản này không có wheel dựng sẵn cho Python 3.14 (bản mặc định của Ubuntu 26.04) nên pip phải build từ Rust và thất bại. Mình không đổi `requirements.txt` mà tạo lại venv bằng **Python 3.11** (cài qua `uv`), trùng với `python:3.11-slim` trong Dockerfile để local và container giống nhau.
+- **`/ask` khi Redis chết mất khoảng 4 giây** mới trả 503 (client Redis thử lại và phân giải tên `redis` thất bại), dù `/ready` báo 503 gần như ngay. Chấp nhận được vì load balancer đã dựa vào `/ready` để ngừng gửi traffic.
+- **Cost guard tính chung cho cả service** (một ngân sách mỗi ngày), đúng yêu cầu của bài: bảo vệ tổng hoá đơn LLM. Muốn giới hạn riêng từng user thì đổi key thành `cost:<user>:<ngày>` như cách làm ở Exercise 4.4.
 
 ## AI log
 
@@ -628,3 +707,4 @@ Ghi chú khi chạy: lệnh `docker compose stop agent-2` không dừng được
 | CP2 | Nhờ Claude chạy Part 2 (build 2 image, chạy container, chạy stack Compose) và soạn câu trả lời | Claude chạy các lệnh `docker build/run/compose` trên máy tôi, đo kích thước bằng `docker images`, xử lý lỗi cổng 80 bằng file override sang 8081, soạn câu trả lời 2.1–2.4 và sơ đồ | Số MB lấy từ output `docker images` trên máy tôi; đối chiếu câu trả lời với từng dòng trong 2 Dockerfile và `docker-compose.yml`; kiểm tra IP trong log agent là IP của Nginx |
 | CP3 | Nhờ Claude chạy test Part 4 (API key, JWT, vòng lặp rate limit), viết hàm cost guard bằng Redis và soạn câu trả lời | Script chạy cả hai bản trong WSL, output curl đã che token; hàm `check_budget` dùng `INCRBYFLOAT` + key theo tháng, test với Redis container; phát hiện field `budget_remaining_usd` trả sai và header `server` không bị xoá | Đối chiếu mã 401/403/200/429 với code `auth.py`, `rate_limiter.py`; kiểm tra kết quả test cost guard (lần gọi 8+3 bị chặn, TTL 32 ngày); đọc lại lý do dùng `INCRBYFLOAT` thay vì GET rồi SET |
 | CP4 | Nhờ Claude chạy Part 5 (health/ready, thử SIGTERM khi đang có request, stack 3 instance, `test_stateless.py`, kill 1 instance) và soạn câu trả lời | Output thật của các test; giải thích vì sao log `Received signal 15` in cuối cùng; phát hiện app lặng lẽ chuyển sang lưu RAM khi không có Redis, field `turn` lệch 1, Nginx chỉ phân giải DNS lúc khởi động. Lần kill đầu bị sai (dùng nhầm `docker compose stop agent-2`), Claude tự phát hiện vì vẫn thấy đủ 3 instance và làm lại bằng `docker stop` | Đối chiếu IP trong `X-Served-By` với lỗi `Host is unreachable` trong log Nginx; kiểm tra request dài vẫn trả 200 sau SIGTERM và exit code 0; kiểm tra history còn đủ 14 tin sau khi kill instance |
+| CP5 | Nhờ Claude **viết toàn bộ code Part 6** (`app/*.py`, Dockerfile, compose, `.dockerignore`, `.env.example`, `railway.toml`, `render.yaml`) và soạn phần giải thích | Claude đọc README "hợp đồng" và toàn bộ `check_production_ready.py` trước khi viết; phát hiện `pydantic==2.9.0` không cài được trên Python 3.14, nên tạo lại venv Python 3.11 bằng `uv`; code đạt `PASS 12/12` ở lần chạy đầy đủ đầu tiên. Không sửa `check_production_ready.py` | Chạy `check_production_ready.py` bản đầy đủ có Docker; tự test thêm bằng `docker compose`: 401/200/422, 429 sau 10 request, tắt Redis thì `/health` 200 còn `/ready` 503, bật lại thì phục hồi; kiểm tra API key không xuất hiện trong log; đọc lại từng file để giải thích được với Lab Coach |
